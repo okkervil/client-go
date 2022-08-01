@@ -23,7 +23,7 @@ import (
 	"reflect"
 	"testing"
 
-	"sigs.k8s.io/yaml"
+	"github.com/ghodss/yaml"
 )
 
 func newMergedConfig(certFile, certContent, keyFile, keyContent, caFile, caContent string, t *testing.T) Config {
@@ -243,7 +243,7 @@ func Example_minifyAndShorten() {
 	//     LocationOfOrigin: ""
 	//     client-certificate-data: REDACTED
 	//     client-key-data: REDACTED
-	//     token: REDACTED
+	//     token: red-token
 }
 
 func TestShortenSuccess(t *testing.T) {
@@ -298,8 +298,5 @@ func TestShortenSuccess(t *testing.T) {
 	}
 	if string(mutatingConfig.AuthInfos[changingAuthInfo].ClientKeyData) != redacted {
 		t.Errorf("expected %v, got %v", redacted, string(mutatingConfig.AuthInfos[changingAuthInfo].ClientKeyData))
-	}
-	if mutatingConfig.AuthInfos[changingAuthInfo].Token != "REDACTED" {
-		t.Errorf("expected REDACTED, got %v", mutatingConfig.AuthInfos[changingAuthInfo].Token)
 	}
 }

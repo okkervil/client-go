@@ -2,13 +2,19 @@
 
 Go clients for talking to a [kubernetes](http://kubernetes.io/) cluster.
 
-We recommend using the `v0.x.y` tags for Kubernetes releases >= `v1.17.0` and
-`kubernetes-1.x.y` tags for Kubernetes releases < `v1.17.0`.
+We currently recommend using the v8.0.0 tag. See [INSTALL.md](/INSTALL.md) for
+detailed installation instructions. `go get k8s.io/client-go/...` works, but
+will build `master`, which doesn't handle the dependencies well.
 
-The fastest way to add this library to a project is to run `go get k8s.io/client-go@latest` with go1.16+.
-See [INSTALL.md](/INSTALL.md) for detailed installation instructions and troubleshooting.
-
+[![BuildStatus Widget]][BuildStatus Result]
+[![GoReport Widget]][GoReport Status]
 [![GoDocWidget]][GoDocReference]
+
+[BuildStatus Result]: https://travis-ci.org/kubernetes/client-go
+[BuildStatus Widget]: https://travis-ci.org/kubernetes/client-go.svg?branch=master
+
+[GoReport Status]: https://goreportcard.com/report/github.com/kubernetes/client-go
+[GoReport Widget]: https://goreportcard.com/badge/github.com/kubernetes/client-go
 
 [GoDocWidget]: https://godoc.org/k8s.io/client-go?status.svg
 [GoDocReference]:https://godoc.org/k8s.io/client-go 
@@ -32,37 +38,47 @@ See [INSTALL.md](/INSTALL.md) for detailed installation instructions and trouble
 * The `kubernetes` package contains the clientset to access Kubernetes API.
 * The `discovery` package is used to discover APIs supported by a Kubernetes API server.
 * The `dynamic` package contains a dynamic client that can perform generic operations on arbitrary Kubernetes API objects.
-* The `plugin/pkg/client/auth` packages contain optional authentication plugins for obtaining credentials from external sources.
 * The `transport` package is used to set up auth and start a connection.
 * The `tools/cache` package is useful for writing controllers.
 
 ### Versioning
 
-- For each `v1.x.y` Kubernetes release, the major version (first digit)
-would remain `0`.
+`client-go` follows [semver](http://semver.org/). We will not make
+backwards-incompatible changes without incrementing the major version number. A
+change is backwards-incompatible either if it *i)* changes the public interfaces
+of `client-go`, or *ii)* makes `client-go` incompatible with otherwise supported
+versions of Kubernetes clusters.
 
-- Bugfixes will result in the patch version (third digit) changing. PRs that are
+Changes that add features in a backwards-compatible way will result in bumping
+the minor version (second digit) number.
+
+Bugfixes will result in the patch version (third digit) changing. PRs that are
 cherry-picked into an older Kubernetes release branch will result in an update
 to the corresponding branch in `client-go`, with a corresponding new tag
 changing the patch version.
 
+A consequence of this is that `client-go` version numbers will be unrelated to
+Kubernetes version numbers.
+
 #### Branches and tags.
 
-We will create a new branch and tag for each increment in the minor version
-number. We will create only a new tag for each increment in the patch
+We will create a new branch and tag for each increment in the major version number or
+minor version number. We will create only a new tag for each increment in the patch
 version number. See [semver](http://semver.org/) for definitions of major,
 minor, and patch.
 
-The HEAD of the master branch in client-go will track the HEAD of the master
-branch in the main Kubernetes repo.
+The master branch will track HEAD in the main Kubernetes repo and
+accumulate changes. Consider HEAD to have the version `x.(y+1).0-alpha` or
+`(x+1).0.0-alpha` (depending on whether it has accumulated a breaking change or
+not), where `x` and `y` are the current major and minor versions.
 
 #### Compatibility: your code <-> client-go
 
-The `v0.x.y` tags indicate that go APIs may change in incompatible ways in
-different versions.
-
-See [INSTALL.md](INSTALL.md) for guidelines on requiring a specific
-version of client-go.
+`client-go` follows [semver](http://semver.org/), so until the major version of
+client-go gets increased, your code will compile and will continue to work with
+explicitly supported versions of Kubernetes clusters. You must use a dependency
+management system and pin a specific major version of `client-go` to get this
+benefit, as HEAD follows the upstream Kubernetes repo.
 
 #### Compatibility: client-go <-> Kubernetes clusters
 
@@ -75,15 +91,17 @@ We will backport bugfixes--but not new features--into older versions of
 
 #### Compatibility matrix
 
-|                               | Kubernetes 1.15 | Kubernetes 1.16 | Kubernetes 1.17 | Kubernetes 1.18 | Kubernetes 1.19 | Kubernetes 1.20 |
-|-------------------------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|
-| `kubernetes-1.15.0`           | ✓               | +-              | +-              | +-              | +-              | +-              |
-| `kubernetes-1.16.0`           | +-              | ✓               | +-              | +-              | +-              | +-              |
-| `kubernetes-1.17.0`/`v0.17.0` | +-              | +-              | ✓               | +-              | +-              | +-              |
-| `kubernetes-1.18.0`/`v0.18.0` | +-              | +-              | +-              | ✓               | +-              | +-              |
-| `kubernetes-1.19.0`/`v0.19.0` | +-              | +-              | +-              | +-              | ✓               | +-              |
-| `kubernetes-1.20.0`/`v0.20.0` | +-              | +-              | +-              | +-              | +-              | ✓               |
-| `HEAD`                        | +-              | +-              | +-              | +-              | +-              | +-              |
+|                     | Kubernetes 1.5 | Kubernetes 1.6 | Kubernetes 1.7 | Kubernetes 1.8 | Kubernetes 1.9 | Kubernetes 1.10 | Kubernetes 1.11 |
+|---------------------|----------------|----------------|----------------|----------------|----------------|-----------------|-----------------|
+| client-go 1.5       | -              | -              | -              | -              | -              | -               | -               |
+| client-go 2.0       | ✓              | +-             | +-             | +-             | +-             | +-              | +-              |
+| client-go 3.0       | +-             | ✓              | -              | +-             | +-             | +-              | +-              |
+| client-go 4.0       | +-             | +-             | ✓              | +-             | +-             | +-              | +-              |
+| client-go 5.0       | +-             | +-             | +-             | ✓              | +-             | +-              | +-              |
+| client-go 6.0       | +-             | +-             | +-             | +-             | ✓              | +-              | +-              |
+| client-go 7.0       | +-             | +-             | +-             | +-             | +-             | ✓               | +-              |
+| client-go 8.0       | +-             | +-             | +-             | +-             | +-             | +-              | ✓               |
+| client-go HEAD      | +-             | +-             | +-             | +-             | +-             | +-              | +-              |
 
 Key:
 
@@ -104,24 +122,15 @@ between client-go versions.
 
 | Branch         | Canonical source code location       | Maintenance status            |
 |----------------|--------------------------------------|-------------------------------|
-| `release-1.4`  | Kubernetes main repo, 1.4 branch     | = -                           |
-| `release-1.5`  | Kubernetes main repo, 1.5 branch     | = -                           |
-| `release-2.0`  | Kubernetes main repo, 1.5 branch     | = -                           |
-| `release-3.0`  | Kubernetes main repo, 1.6 branch     | = -                           |
-| `release-4.0`  | Kubernetes main repo, 1.7 branch     | = -                           |
-| `release-5.0`  | Kubernetes main repo, 1.8 branch     | = -                           |
-| `release-6.0`  | Kubernetes main repo, 1.9 branch     | = -                           |
-| `release-7.0`  | Kubernetes main repo, 1.10 branch    | = -                           |
-| `release-8.0`  | Kubernetes main repo, 1.11 branch    | =-                            |
-| `release-9.0`  | Kubernetes main repo, 1.12 branch    | =-                            |
-| `release-10.0` | Kubernetes main repo, 1.13 branch    | =-                            |
-| `release-11.0` | Kubernetes main repo, 1.14 branch    | =-                            |
-| `release-12.0` | Kubernetes main repo, 1.15 branch    | =-                            |
-| `release-13.0` | Kubernetes main repo, 1.16 branch    | =-                            |
-| `release-14.0` | Kubernetes main repo, 1.17 branch    | ✓                             |
-| `release-1.18` | Kubernetes main repo, 1.18 branch    | ✓                             |
-| `release-1.19` | Kubernetes main repo, 1.19 branch    | ✓                             |
-| `release-1.20` | Kubernetes main repo, 1.20 branch    | ✓                             |
+| client-go 1.4  | Kubernetes main repo, 1.4 branch     | = -                           |
+| client-go 1.5  | Kubernetes main repo, 1.5 branch     | = -                           |
+| client-go 2.0  | Kubernetes main repo, 1.5 branch     | = -                           |
+| client-go 3.0  | Kubernetes main repo, 1.6 branch     | = -                           |
+| client-go 4.0  | Kubernetes main repo, 1.7 branch     | = -                           |
+| client-go 5.0  | Kubernetes main repo, 1.8 branch     | = -                           |
+| client-go 6.0  | Kubernetes main repo, 1.9 branch     | ✓                             |
+| client-go 7.0  | Kubernetes main repo, 1.10 branch    | ✓                             |
+| client-go 8.0  | Kubernetes main repo, 1.11 branch    | ✓                             |
 | client-go HEAD | Kubernetes main repo, master branch  | ✓                             |
 
 Key:
@@ -148,19 +157,14 @@ existing users won't be broken.
 
 This repository is still a mirror of
 [k8s.io/kubernetes/staging/src/client-go](https://github.com/kubernetes/kubernetes/tree/master/staging/src/k8s.io/client-go),
-the code development is still done in the staging area.
-
-Since Kubernetes `v1.8.0`, when syncing the code from the staging area,
-we also sync the Kubernetes version tags to client-go, prefixed with
-`kubernetes-`. From Kubernetes `v1.17.0`, we also create matching semver
-`v0.x.y` tags for each `v1.x.y` Kubernetes release.
-
-For example, if you check out the `kubernetes-1.17.0` or the `v0.17.0` tag in
-client-go, the code you get is exactly the same as if you check out the `v1.17.0`
-tag in Kubernetes, and change directory to `staging/src/k8s.io/client-go`.
-
-The purpose is to let users quickly find matching commits among published repos,
-like [sample-apiserver](https://github.com/kubernetes/sample-apiserver),
+the code development is still done in the staging area. Since Kubernetes 1.8
+release, when syncing the code from the staging area, we also sync the Kubernetes
+version tags to client-go, prefixed with "kubernetes-". For example, if you check
+out the `kubernetes-v1.8.0` tag in client-go, the code you get is exactly the
+same as if you check out the `v1.8.0` tag in kubernetes, and change directory to
+`staging/src/k8s.io/client-go`. The purpose is to let users quickly find matching
+commits among published repos, like
+[sample-apiserver](https://github.com/kubernetes/sample-apiserver),
 [apiextension-apiserver](https://github.com/kubernetes/apiextensions-apiserver),
 etc. The Kubernetes version tag does NOT claim any backwards compatibility
 guarantees for client-go. Please check the [semantic versions](#versioning) if
@@ -168,19 +172,10 @@ you care about backwards compatibility.
 
 ### How to get it
 
-To get the latest version, use go1.16+ and fetch using the `go get` command. For example:
-
-```
-go get k8s.io/client-go@latest
-```
-
-To get a specific version, use go1.11+ and fetch the desired version using the `go get` command. For example:
-
-```
-go get k8s.io/client-go@v0.20.4
-```
-
-See [INSTALL.md](/INSTALL.md) for detailed instructions and troubleshooting.
+You can use `go get k8s.io/client-go/...` to get client-go, but **you will get
+the unstable master branch** and `client-go`'s vendored dependencies will not be
+added to your `$GOPATH`. So we think most users will want to use a dependency
+management system. See [INSTALL.md](/INSTALL.md) for detailed instructions.
 
 ### How to use it
 
@@ -190,7 +185,9 @@ refer to the out-of-cluster [example](examples/out-of-cluster-client-configurati
 
 ### Dependency management
 
-For details on how to correctly use a dependency management for installing client-go, please see [INSTALL.md](INSTALL.md).
+If your application depends on a package that client-go depends on, and you let the Go compiler find the dependency in `GOPATH`, you will end up with duplicated dependencies: one copy from the `GOPATH`, and one from the vendor folder of client-go. This will cause unexpected runtime error like flag redefinition, since the go compiler ends up importing both packages separately, even if they are exactly the same thing. If this happens, you can either
+* run `godep restore` ([godep](https://github.com/tools/godep)) in the client-go/ folder, then remove the vendor folder of client-go. Then the packages in your GOPATH will be the only copy
+* or run `godep save` in your application folder to flatten all dependencies.
 
 ### Contributing code
 Please send pull requests against the client packages in the Kubernetes main [repository](https://github.com/kubernetes/kubernetes). Changes in the staging area will be published to this repository every day.

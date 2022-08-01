@@ -19,8 +19,7 @@ package restmapper
 import (
 	"testing"
 
-	openapi_v2 "github.com/google/gnostic/openapiv2"
-	"github.com/google/go-cmp/cmp"
+	"github.com/googleapis/gnostic/OpenAPIv2"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -28,7 +27,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/openapi"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/rest/fake"
 )
@@ -196,65 +194,6 @@ func TestKindFor(t *testing.T) {
 	}
 }
 
-func TestKindForWithNewCRDs(t *testing.T) {
-	tests := map[string]struct {
-		in       schema.GroupVersionResource
-		expected schema.GroupVersionKind
-		srvRes   []*metav1.APIResourceList
-	}{
-		"": {
-			in:       schema.GroupVersionResource{Group: "a", Version: "", Resource: "sc"},
-			expected: schema.GroupVersionKind{Group: "a", Version: "v1", Kind: "StorageClass"},
-			srvRes: []*metav1.APIResourceList{
-				{
-					GroupVersion: "a/v1",
-					APIResources: []metav1.APIResource{
-						{
-							Name:       "storageclasses",
-							ShortNames: []string{"sc"},
-							Kind:       "StorageClass",
-						},
-					},
-				},
-			},
-		},
-	}
-
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			invalidateCalled := false
-			fakeDiscovery := &fakeDiscoveryClient{}
-			fakeDiscovery.serverResourcesHandler = func() ([]*metav1.APIResourceList, error) {
-				if invalidateCalled {
-					return test.srvRes, nil
-				}
-				return []*metav1.APIResourceList{}, nil
-			}
-			fakeCachedDiscovery := &fakeCachedDiscoveryClient{DiscoveryInterface: fakeDiscovery}
-			fakeCachedDiscovery.invalidateHandler = func() {
-				invalidateCalled = true
-			}
-			fakeCachedDiscovery.freshHandler = func() bool {
-				return invalidateCalled
-			}
-
-			// in real world the discovery client is fronted with a cache which
-			// will answer the initial request, only failure to match will trigger
-			// the cache invalidation and live discovery call
-			delegate := NewDeferredDiscoveryRESTMapper(fakeCachedDiscovery)
-			mapper := NewShortcutExpander(delegate, fakeCachedDiscovery)
-
-			gvk, err := mapper.KindFor(test.in)
-			if err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
-			if diff := cmp.Equal(gvk, test.expected); !diff {
-				t.Errorf("unexpected data returned %#v, expected %#v", gvk, test.expected)
-			}
-		})
-	}
-}
-
 type fakeRESTMapper struct {
 	kindForInput schema.GroupVersionResource
 }
@@ -326,20 +265,11 @@ func (c *fakeDiscoveryClient) ServerResourcesForGroupVersion(groupVersion string
 	return nil, errors.NewNotFound(schema.GroupResource{}, "")
 }
 
-func (c *fakeDiscoveryClient) ServerGroupsAndResources() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
-	sgs, err := c.ServerGroups()
-	if err != nil {
-		return nil, nil, err
-	}
-	resultGroups := []*metav1.APIGroup{}
-	for i := range sgs.Groups {
-		resultGroups = append(resultGroups, &sgs.Groups[i])
-	}
+func (c *fakeDiscoveryClient) ServerResources() ([]*metav1.APIResourceList, error) {
 	if c.serverResourcesHandler != nil {
-		rs, err := c.serverResourcesHandler()
-		return resultGroups, rs, err
+		return c.serverResourcesHandler()
 	}
-	return resultGroups, []*metav1.APIResourceList{}, nil
+	return []*metav1.APIResourceList{}, nil
 }
 
 func (c *fakeDiscoveryClient) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
@@ -356,29 +286,4 @@ func (c *fakeDiscoveryClient) ServerVersion() (*version.Info, error) {
 
 func (c *fakeDiscoveryClient) OpenAPISchema() (*openapi_v2.Document, error) {
 	return &openapi_v2.Document{}, nil
-}
-
-func (c *fakeDiscoveryClient) OpenAPIV3() openapi.Client {
-	panic("implement me")
-}
-
-type fakeCachedDiscoveryClient struct {
-	discovery.DiscoveryInterface
-	freshHandler      func() bool
-	invalidateHandler func()
-}
-
-var _ discovery.CachedDiscoveryInterface = &fakeCachedDiscoveryClient{}
-
-func (c *fakeCachedDiscoveryClient) Fresh() bool {
-	if c.freshHandler != nil {
-		return c.freshHandler()
-	}
-	return true
-}
-
-func (c *fakeCachedDiscoveryClient) Invalidate() {
-	if c.invalidateHandler != nil {
-		c.invalidateHandler()
-	}
 }

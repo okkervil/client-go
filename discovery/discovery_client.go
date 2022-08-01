@@ -17,19 +17,16 @@ limitations under the License.
 package discovery
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	//nolint:staticcheck // SA1019 Keep using module since it's still being maintained and the api of google.golang.org/protobuf/proto differs
 	"github.com/golang/protobuf/proto"
-	openapi_v2 "github.com/google/gnostic/openapiv2"
+	"github.com/googleapis/gnostic/OpenAPIv2"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,22 +36,17 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/openapi"
 	restclient "k8s.io/client-go/rest"
 )
 
 const (
-	// defaultRetries is the number of times a resource discovery is repeated if an api group disappears on the fly (e.g. CustomResourceDefinitions).
+	// defaultRetries is the number of times a resource discovery is repeated if an api group disappears on the fly (e.g. ThirdPartyResources).
 	defaultRetries = 2
 	// protobuf mime type
-	openAPIV2mimePb = "application/com.github.proto-openapi.spec.v2@v1.0+protobuf"
-
+	mimePb = "application/com.github.proto-openapi.spec.v2@v1.0+protobuf"
 	// defaultTimeout is the maximum amount of time per request when no timeout has been set on a RESTClient.
 	// Defaults to 32s in order to have a distinguishable length of time, relative to other timeouts that exist.
 	defaultTimeout = 32 * time.Second
-
-	// defaultBurst is the default burst to be used with the discovery client's token bucket rate limiter
-	defaultBurst = 300
 )
 
 // DiscoveryInterface holds the methods that discover server-supported API groups,
@@ -65,13 +57,9 @@ type DiscoveryInterface interface {
 	ServerResourcesInterface
 	ServerVersionInterface
 	OpenAPISchemaInterface
-	OpenAPIV3SchemaInterface
 }
 
 // CachedDiscoveryInterface is a DiscoveryInterface with cache invalidation and freshness.
-// Note that If the ServerResourcesForGroupVersion method returns a cache miss
-// error, the user needs to explicitly call Invalidate to clear the cache,
-// otherwise the same cache miss error will be returned next time.
 type CachedDiscoveryInterface interface {
 	DiscoveryInterface
 	// Fresh is supposed to tell the caller whether or not to retry if the cache
@@ -80,8 +68,7 @@ type CachedDiscoveryInterface interface {
 	// TODO: this needs to be revisited, this interface can't be locked properly
 	// and doesn't make a lot of sense.
 	Fresh() bool
-	// Invalidate enforces that no cached data that is older than the current time
-	// is used.
+	// Invalidate enforces that no cached data is used in the future that is older than the current time.
 	Invalidate()
 }
 
@@ -96,22 +83,13 @@ type ServerGroupsInterface interface {
 type ServerResourcesInterface interface {
 	// ServerResourcesForGroupVersion returns the supported resources for a group and version.
 	ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error)
-	// ServerGroupsAndResources returns the supported groups and resources for all groups and versions.
-	//
-	// The returned group and resource lists might be non-nil with partial results even in the
-	// case of non-nil error.
-	ServerGroupsAndResources() ([]*metav1.APIGroup, []*metav1.APIResourceList, error)
+	// ServerResources returns the supported resources for all groups and versions.
+	ServerResources() ([]*metav1.APIResourceList, error)
 	// ServerPreferredResources returns the supported resources with the version preferred by the
 	// server.
-	//
-	// The returned group and resource lists might be non-nil with partial results even in the
-	// case of non-nil error.
 	ServerPreferredResources() ([]*metav1.APIResourceList, error)
 	// ServerPreferredNamespacedResources returns the supported namespaced resources with the
 	// version preferred by the server.
-	//
-	// The returned resource list might be non-nil with partial results even in the case of
-	// non-nil error.
 	ServerPreferredNamespacedResources() ([]*metav1.APIResourceList, error)
 }
 
@@ -125,10 +103,6 @@ type ServerVersionInterface interface {
 type OpenAPISchemaInterface interface {
 	// OpenAPISchema retrieves and parses the swagger API schema the server supports.
 	OpenAPISchema() (*openapi_v2.Document, error)
-}
-
-type OpenAPIV3SchemaInterface interface {
-	OpenAPIV3() openapi.Client
 }
 
 // DiscoveryClient implements the functions that discover server-supported API groups,
@@ -161,7 +135,7 @@ func apiVersionsToAPIGroup(apiVersions *metav1.APIVersions) (apiGroup metav1.API
 func (d *DiscoveryClient) ServerGroups() (apiGroupList *metav1.APIGroupList, err error) {
 	// Get the groupVersions exposed at /api
 	v := &metav1.APIVersions{}
-	err = d.restClient.Get().AbsPath(d.LegacyPrefix).Do(context.TODO()).Into(v)
+	err = d.restClient.Get().AbsPath(d.LegacyPrefix).Do().Into(v)
 	apiGroup := metav1.APIGroup{}
 	if err == nil && len(v.Versions) != 0 {
 		apiGroup = apiVersionsToAPIGroup(v)
@@ -172,7 +146,7 @@ func (d *DiscoveryClient) ServerGroups() (apiGroupList *metav1.APIGroupList, err
 
 	// Get the groupVersions exposed at /apis
 	apiGroupList = &metav1.APIGroupList{}
-	err = d.restClient.Get().AbsPath("/apis").Do(context.TODO()).Into(apiGroupList)
+	err = d.restClient.Get().AbsPath("/apis").Do().Into(apiGroupList)
 	if err != nil && !errors.IsNotFound(err) && !errors.IsForbidden(err) {
 		return nil, err
 	}
@@ -202,7 +176,7 @@ func (d *DiscoveryClient) ServerResourcesForGroupVersion(groupVersion string) (r
 	resources = &metav1.APIResourceList{
 		GroupVersion: groupVersion,
 	}
-	err = d.restClient.Get().AbsPath(url.String()).Do(context.TODO()).Into(resources)
+	err = d.restClient.Get().AbsPath(url.String()).Do().Into(resources)
 	if err != nil {
 		// ignore 403 or 404 error to be compatible with an v1.0 server.
 		if groupVersion == "v1" && (errors.IsNotFound(err) || errors.IsForbidden(err)) {
@@ -213,11 +187,14 @@ func (d *DiscoveryClient) ServerResourcesForGroupVersion(groupVersion string) (r
 	return resources, nil
 }
 
-// ServerGroupsAndResources returns the supported resources for all groups and versions.
-func (d *DiscoveryClient) ServerGroupsAndResources() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
-	return withRetries(defaultRetries, func() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
-		return ServerGroupsAndResources(d)
-	})
+// serverResources returns the supported resources for all groups and versions.
+func (d *DiscoveryClient) serverResources() ([]*metav1.APIResourceList, error) {
+	return ServerResources(d)
+}
+
+// ServerResources returns the supported resources for all groups and versions.
+func (d *DiscoveryClient) ServerResources() ([]*metav1.APIResourceList, error) {
+	return withRetries(defaultRetries, d.serverResources)
 }
 
 // ErrGroupDiscoveryFailed is returned if one or more API groups fail to load.
@@ -243,21 +220,23 @@ func IsGroupDiscoveryFailedError(err error) bool {
 	return err != nil && ok
 }
 
-func ServerGroupsAndResources(d DiscoveryInterface) ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
-	sgs, err := d.ServerGroups()
-	if sgs == nil {
-		return nil, nil, err
-	}
-	resultGroups := []*metav1.APIGroup{}
-	for i := range sgs.Groups {
-		resultGroups = append(resultGroups, &sgs.Groups[i])
+// serverPreferredResources returns the supported resources with the version preferred by the server.
+func (d *DiscoveryClient) serverPreferredResources() ([]*metav1.APIResourceList, error) {
+	return ServerPreferredResources(d)
+}
+
+// ServerResources uses the provided discovery interface to look up supported resources for all groups and versions.
+func ServerResources(d DiscoveryInterface) ([]*metav1.APIResourceList, error) {
+	apiGroups, err := d.ServerGroups()
+	if err != nil {
+		return nil, err
 	}
 
-	groupVersionResources, failedGroups := fetchGroupVersionResources(d, sgs)
+	groupVersionResources, failedGroups := fetchGroupVersionResources(d, apiGroups)
 
 	// order results by group/version discovery order
 	result := []*metav1.APIResourceList{}
-	for _, apiGroup := range sgs.Groups {
+	for _, apiGroup := range apiGroups.Groups {
 		for _, version := range apiGroup.Versions {
 			gv := schema.GroupVersion{Group: apiGroup.Name, Version: version.Version}
 			if resources, ok := groupVersionResources[gv]; ok {
@@ -267,10 +246,10 @@ func ServerGroupsAndResources(d DiscoveryInterface) ([]*metav1.APIGroup, []*meta
 	}
 
 	if len(failedGroups) == 0 {
-		return resultGroups, result, nil
+		return result, nil
 	}
 
-	return resultGroups, result, &ErrGroupDiscoveryFailed{Groups: failedGroups}
+	return result, &ErrGroupDiscoveryFailed{Groups: failedGroups}
 }
 
 // ServerPreferredResources uses the provided discovery interface to look up preferred resources
@@ -284,8 +263,8 @@ func ServerPreferredResources(d DiscoveryInterface) ([]*metav1.APIResourceList, 
 
 	result := []*metav1.APIResourceList{}
 	grVersions := map[schema.GroupResource]string{}                         // selected version of a GroupResource
-	grAPIResources := map[schema.GroupResource]*metav1.APIResource{}        // selected APIResource for a GroupResource
-	gvAPIResourceLists := map[schema.GroupVersion]*metav1.APIResourceList{} // blueprint for a APIResourceList for later grouping
+	grApiResources := map[schema.GroupResource]*metav1.APIResource{}        // selected APIResource for a GroupResource
+	gvApiResourceLists := map[schema.GroupVersion]*metav1.APIResourceList{} // blueprint for a APIResourceList for later grouping
 
 	for _, apiGroup := range serverGroupList.Groups {
 		for _, version := range apiGroup.Versions {
@@ -297,11 +276,11 @@ func ServerPreferredResources(d DiscoveryInterface) ([]*metav1.APIResourceList, 
 			}
 
 			// create empty list which is filled later in another loop
-			emptyAPIResourceList := metav1.APIResourceList{
+			emptyApiResourceList := metav1.APIResourceList{
 				GroupVersion: version.GroupVersion,
 			}
-			gvAPIResourceLists[groupVersion] = &emptyAPIResourceList
-			result = append(result, &emptyAPIResourceList)
+			gvApiResourceLists[groupVersion] = &emptyApiResourceList
+			result = append(result, &emptyApiResourceList)
 
 			for i := range apiResourceList.APIResources {
 				apiResource := &apiResourceList.APIResources[i]
@@ -309,21 +288,21 @@ func ServerPreferredResources(d DiscoveryInterface) ([]*metav1.APIResourceList, 
 					continue
 				}
 				gv := schema.GroupResource{Group: apiGroup.Name, Resource: apiResource.Name}
-				if _, ok := grAPIResources[gv]; ok && version.Version != apiGroup.PreferredVersion.Version {
+				if _, ok := grApiResources[gv]; ok && version.Version != apiGroup.PreferredVersion.Version {
 					// only override with preferred version
 					continue
 				}
 				grVersions[gv] = version.Version
-				grAPIResources[gv] = apiResource
+				grApiResources[gv] = apiResource
 			}
 		}
 	}
 
 	// group selected APIResources according to GroupVersion into APIResourceLists
-	for groupResource, apiResource := range grAPIResources {
+	for groupResource, apiResource := range grApiResources {
 		version := grVersions[groupResource]
 		groupVersion := schema.GroupVersion{Group: groupResource.Group, Version: version}
-		apiResourceList := gvAPIResourceLists[groupVersion]
+		apiResourceList := gvApiResourceLists[groupVersion]
 		apiResourceList.APIResources = append(apiResourceList.APIResources, *apiResource)
 	}
 
@@ -334,7 +313,7 @@ func ServerPreferredResources(d DiscoveryInterface) ([]*metav1.APIResourceList, 
 	return result, &ErrGroupDiscoveryFailed{Groups: failedGroups}
 }
 
-// fetchServerResourcesForGroupVersions uses the discovery client to fetch the resources for the specified groups in parallel.
+// fetchServerResourcesForGroupVersions uses the discovery client to fetch the resources for the specified groups in parallel
 func fetchGroupVersionResources(d DiscoveryInterface, apiGroups *metav1.APIGroupList) (map[schema.GroupVersion]*metav1.APIResourceList, map[schema.GroupVersion]error) {
 	groupVersionResources := make(map[schema.GroupVersion]*metav1.APIResourceList)
 	failedGroups := make(map[schema.GroupVersion]error)
@@ -358,9 +337,7 @@ func fetchGroupVersionResources(d DiscoveryInterface, apiGroups *metav1.APIGroup
 				if err != nil {
 					// TODO: maybe restrict this to NotFound errors
 					failedGroups[groupVersion] = err
-				}
-				if apiResourceList != nil {
-					// even in case of error, some fallback might have been returned
+				} else {
 					groupVersionResources[groupVersion] = apiResourceList
 				}
 			}()
@@ -374,11 +351,7 @@ func fetchGroupVersionResources(d DiscoveryInterface, apiGroups *metav1.APIGroup
 // ServerPreferredResources returns the supported resources with the version preferred by the
 // server.
 func (d *DiscoveryClient) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
-	_, rs, err := withRetries(defaultRetries, func() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
-		rs, err := ServerPreferredResources(d)
-		return nil, rs, err
-	})
-	return rs, err
+	return withRetries(defaultRetries, d.serverPreferredResources)
 }
 
 // ServerPreferredNamespacedResources returns the supported namespaced resources with the
@@ -397,26 +370,26 @@ func ServerPreferredNamespacedResources(d DiscoveryInterface) ([]*metav1.APIReso
 
 // ServerVersion retrieves and parses the server's version (git version).
 func (d *DiscoveryClient) ServerVersion() (*version.Info, error) {
-	body, err := d.restClient.Get().AbsPath("/version").Do(context.TODO()).Raw()
+	body, err := d.restClient.Get().AbsPath("/version").Do().Raw()
 	if err != nil {
 		return nil, err
 	}
 	var info version.Info
 	err = json.Unmarshal(body, &info)
 	if err != nil {
-		return nil, fmt.Errorf("unable to parse the server version: %v", err)
+		return nil, fmt.Errorf("got '%s': %v", string(body), err)
 	}
 	return &info, nil
 }
 
-// OpenAPISchema fetches the open api v2 schema using a rest client and parses the proto.
+// OpenAPISchema fetches the open api schema using a rest client and parses the proto.
 func (d *DiscoveryClient) OpenAPISchema() (*openapi_v2.Document, error) {
-	data, err := d.restClient.Get().AbsPath("/openapi/v2").SetHeader("Accept", openAPIV2mimePb).Do(context.TODO()).Raw()
+	data, err := d.restClient.Get().AbsPath("/openapi/v2").SetHeader("Accept", mimePb).Do().Raw()
 	if err != nil {
 		if errors.IsForbidden(err) || errors.IsNotFound(err) || errors.IsNotAcceptable(err) {
 			// single endpoint not found/registered in old server, try to fetch old endpoint
-			// TODO: remove this when kubectl/client-go don't work with 1.9 server
-			data, err = d.restClient.Get().AbsPath("/swagger-2.0.0.pb-v1").Do(context.TODO()).Raw()
+			// TODO(roycaihw): remove this in 1.11
+			data, err = d.restClient.Get().AbsPath("/swagger-2.0.0.pb-v1").Do().Raw()
 			if err != nil {
 				return nil, err
 			}
@@ -432,25 +405,20 @@ func (d *DiscoveryClient) OpenAPISchema() (*openapi_v2.Document, error) {
 	return document, nil
 }
 
-func (d *DiscoveryClient) OpenAPIV3() openapi.Client {
-	return openapi.NewClient(d.restClient)
-}
-
 // withRetries retries the given recovery function in case the groups supported by the server change after ServerGroup() returns.
-func withRetries(maxRetries int, f func() ([]*metav1.APIGroup, []*metav1.APIResourceList, error)) ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
+func withRetries(maxRetries int, f func() ([]*metav1.APIResourceList, error)) ([]*metav1.APIResourceList, error) {
 	var result []*metav1.APIResourceList
-	var resultGroups []*metav1.APIGroup
 	var err error
 	for i := 0; i < maxRetries; i++ {
-		resultGroups, result, err = f()
+		result, err = f()
 		if err == nil {
-			return resultGroups, result, nil
+			return result, nil
 		}
 		if _, ok := err.(*ErrGroupDiscoveryFailed); !ok {
-			return nil, nil, err
+			return nil, err
 		}
 	}
-	return resultGroups, result, err
+	return result, err
 }
 
 func setDiscoveryDefaults(config *restclient.Config) error {
@@ -458,14 +426,6 @@ func setDiscoveryDefaults(config *restclient.Config) error {
 	config.GroupVersion = nil
 	if config.Timeout == 0 {
 		config.Timeout = defaultTimeout
-	}
-	// if a burst limit is not already configured
-	if config.Burst == 0 {
-		// discovery is expected to be bursty, increase the default burst
-		// to accommodate looking up resource info for many API groups.
-		// matches burst set by ConfigFlags#ToDiscoveryClient().
-		// see https://issue.k8s.io/86149
-		config.Burst = defaultBurst
 	}
 	codec := runtime.NoopEncoder{Decoder: scheme.Codecs.UniversalDecoder()}
 	config.NegotiatedSerializer = serializer.NegotiatedSerializerWrapper(runtime.SerializerInfo{Serializer: codec})
@@ -477,29 +437,12 @@ func setDiscoveryDefaults(config *restclient.Config) error {
 
 // NewDiscoveryClientForConfig creates a new DiscoveryClient for the given config. This client
 // can be used to discover supported resources in the API server.
-// NewDiscoveryClientForConfig is equivalent to NewDiscoveryClientForConfigAndClient(c, httpClient),
-// where httpClient was generated with rest.HTTPClientFor(c).
 func NewDiscoveryClientForConfig(c *restclient.Config) (*DiscoveryClient, error) {
 	config := *c
 	if err := setDiscoveryDefaults(&config); err != nil {
 		return nil, err
 	}
-	httpClient, err := restclient.HTTPClientFor(&config)
-	if err != nil {
-		return nil, err
-	}
-	return NewDiscoveryClientForConfigAndClient(&config, httpClient)
-}
-
-// NewDiscoveryClientForConfigAndClient creates a new DiscoveryClient for the given config. This client
-// can be used to discover supported resources in the API server.
-// Note the http client provided takes precedence over the configured transport values.
-func NewDiscoveryClientForConfigAndClient(c *restclient.Config, httpClient *http.Client) (*DiscoveryClient, error) {
-	config := *c
-	if err := setDiscoveryDefaults(&config); err != nil {
-		return nil, err
-	}
-	client, err := restclient.UnversionedRESTClientForConfigAndClient(&config, httpClient)
+	client, err := restclient.UnversionedRESTClientFor(&config)
 	return &DiscoveryClient{restClient: client, LegacyPrefix: "/api"}, err
 }
 
@@ -514,16 +457,16 @@ func NewDiscoveryClientForConfigOrDie(c *restclient.Config) *DiscoveryClient {
 
 }
 
-// NewDiscoveryClient returns a new DiscoveryClient for the given RESTClient.
+// NewDiscoveryClient returns  a new DiscoveryClient for the given RESTClient.
 func NewDiscoveryClient(c restclient.Interface) *DiscoveryClient {
 	return &DiscoveryClient{restClient: c, LegacyPrefix: "/api"}
 }
 
 // RESTClient returns a RESTClient that is used to communicate
 // with API server by this client implementation.
-func (d *DiscoveryClient) RESTClient() restclient.Interface {
-	if d == nil {
+func (c *DiscoveryClient) RESTClient() restclient.Interface {
+	if c == nil {
 		return nil
 	}
-	return d.restClient
+	return c.restClient
 }

@@ -18,19 +18,13 @@ package testing
 
 import (
 	"fmt"
-	"reflect"
-	"sort"
-	"strings"
 	"sync"
-
-	jsonpatch "github.com/evanphx/json-patch"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/watch"
@@ -102,20 +96,10 @@ func ObjectReaction(tracker ObjectTracker) ReactionFunc {
 			if action.GetSubresource() == "" {
 				err = tracker.Create(gvr, action.GetObject(), ns)
 			} else {
-				oldObj, getOldObjErr := tracker.Get(gvr, ns, objMeta.GetName())
-				if getOldObjErr != nil {
-					return true, nil, getOldObjErr
-				}
-				// Check whether the existing historical object type is the same as the current operation object type that needs to be updated, and if it is the same, perform the update operation.
-				if reflect.TypeOf(oldObj) == reflect.TypeOf(action.GetObject()) {
-					// TODO: Currently we're handling subresource creation as an update
-					// on the enclosing resource. This works for some subresources but
-					// might not be generic enough.
-					err = tracker.Update(gvr, action.GetObject(), ns)
-				} else {
-					// If the historical object type is different from the current object type, need to make sure we return the object submitted,don't persist the submitted object in the tracker.
-					return true, action.GetObject(), nil
-				}
+				// TODO: Currently we're handling subresource creation as an update
+				// on the enclosing resource. This works for some subresources but
+				// might not be generic enough.
+				err = tracker.Update(gvr, action.GetObject(), ns)
 			}
 			if err != nil {
 				return true, nil, err
@@ -145,52 +129,23 @@ func ObjectReaction(tracker ObjectTracker) ReactionFunc {
 		case PatchActionImpl:
 			obj, err := tracker.Get(gvr, ns, action.GetName())
 			if err != nil {
-				return true, nil, err
+				// object is not registered
+				return false, nil, err
 			}
 
 			old, err := json.Marshal(obj)
 			if err != nil {
 				return true, nil, err
 			}
+			// Only supports strategic merge patch
+			// TODO: Add support for other Patch types
+			mergedByte, err := strategicpatch.StrategicMergePatch(old, action.GetPatch(), obj)
+			if err != nil {
+				return true, nil, err
+			}
 
-			// reset the object in preparation to unmarshal, since unmarshal does not guarantee that fields
-			// in obj that are removed by patch are cleared
-			value := reflect.ValueOf(obj)
-			value.Elem().Set(reflect.New(value.Type().Elem()).Elem())
-
-			switch action.GetPatchType() {
-			case types.JSONPatchType:
-				patch, err := jsonpatch.DecodePatch(action.GetPatch())
-				if err != nil {
-					return true, nil, err
-				}
-				modified, err := patch.Apply(old)
-				if err != nil {
-					return true, nil, err
-				}
-
-				if err = json.Unmarshal(modified, obj); err != nil {
-					return true, nil, err
-				}
-			case types.MergePatchType:
-				modified, err := jsonpatch.MergePatch(old, action.GetPatch())
-				if err != nil {
-					return true, nil, err
-				}
-
-				if err := json.Unmarshal(modified, obj); err != nil {
-					return true, nil, err
-				}
-			case types.StrategicMergePatchType:
-				mergedByte, err := strategicpatch.StrategicMergePatch(old, action.GetPatch(), obj)
-				if err != nil {
-					return true, nil, err
-				}
-				if err = json.Unmarshal(mergedByte, obj); err != nil {
-					return true, nil, err
-				}
-			default:
-				return true, nil, fmt.Errorf("PatchType is not supported")
+			if err = json.Unmarshal(mergedByte, obj); err != nil {
+				return true, nil, err
 			}
 
 			if err = tracker.Update(gvr, obj, ns); err != nil {
@@ -209,7 +164,7 @@ type tracker struct {
 	scheme  ObjectScheme
 	decoder runtime.Decoder
 	lock    sync.RWMutex
-	objects map[schema.GroupVersionResource]map[types.NamespacedName]runtime.Object
+	objects map[schema.GroupVersionResource][]runtime.Object
 	// The value type of watchers is a map of which the key is either a namespace or
 	// all/non namespace aka "" and its value is list of fake watchers.
 	// Manipulations on resources will broadcast the notification events into the
@@ -226,7 +181,7 @@ func NewObjectTracker(scheme ObjectScheme, decoder runtime.Decoder) ObjectTracke
 	return &tracker{
 		scheme:   scheme,
 		decoder:  decoder,
-		objects:  make(map[schema.GroupVersionResource]map[types.NamespacedName]runtime.Object),
+		objects:  make(map[schema.GroupVersionResource][]runtime.Object),
 		watchers: make(map[schema.GroupVersionResource]map[string][]*watch.RaceFreeFakeWatcher),
 	}
 }
@@ -260,7 +215,7 @@ func (t *tracker) List(gvr schema.GroupVersionResource, gvk schema.GroupVersionK
 		return list, nil
 	}
 
-	matchingObjs, err := filterByNamespace(objs, ns)
+	matchingObjs, err := filterByNamespaceAndName(objs, ns, "")
 	if err != nil {
 		return nil, err
 	}
@@ -294,15 +249,21 @@ func (t *tracker) Get(gvr schema.GroupVersionResource, ns, name string) (runtime
 		return nil, errNotFound
 	}
 
-	matchingObj, ok := objs[types.NamespacedName{Namespace: ns, Name: name}]
-	if !ok {
+	matchingObjs, err := filterByNamespaceAndName(objs, ns, name)
+	if err != nil {
+		return nil, err
+	}
+	if len(matchingObjs) == 0 {
 		return nil, errNotFound
+	}
+	if len(matchingObjs) > 1 {
+		return nil, fmt.Errorf("more than one object matched gvr %s, ns: %q name: %q", gvr, ns, name)
 	}
 
 	// Only one object should match in the tracker if it works
 	// correctly, as Add/Update methods enforce kind/namespace/name
 	// uniqueness.
-	obj := matchingObj.DeepCopyObject()
+	obj := matchingObjs[0].DeepCopyObject()
 	if status, ok := obj.(*metav1.Status); ok {
 		if status.Status != metav1.StatusSuccess {
 			return nil, &errors.StatusError{ErrStatus: *status}
@@ -324,11 +285,6 @@ func (t *tracker) Add(obj runtime.Object) error {
 	if err != nil {
 		return err
 	}
-
-	if partial, ok := obj.(*metav1.PartialObjectMetadata); ok && len(partial.TypeMeta.APIVersion) > 0 {
-		gvks = []schema.GroupVersionKind{partial.TypeMeta.GroupVersionKind()}
-	}
-
 	if len(gvks) == 0 {
 		return fmt.Errorf("no registered kinds for %v", obj)
 	}
@@ -366,10 +322,8 @@ func (t *tracker) getWatches(gvr schema.GroupVersionResource, ns string) []*watc
 		if w := t.watchers[gvr][ns]; w != nil {
 			watches = append(watches, w...)
 		}
-		if ns != metav1.NamespaceAll {
-			if w := t.watchers[gvr][metav1.NamespaceAll]; w != nil {
-				watches = append(watches, w...)
-			}
+		if w := t.watchers[gvr][""]; w != nil {
+			watches = append(watches, w...)
 		}
 	}
 	return watches
@@ -401,22 +355,21 @@ func (t *tracker) add(gvr schema.GroupVersionResource, obj runtime.Object, ns st
 		return errors.NewBadRequest(msg)
 	}
 
-	_, ok := t.objects[gvr]
-	if !ok {
-		t.objects[gvr] = make(map[types.NamespacedName]runtime.Object)
-	}
-
-	namespacedName := types.NamespacedName{Namespace: newMeta.GetNamespace(), Name: newMeta.GetName()}
-	if _, ok = t.objects[gvr][namespacedName]; ok {
-		if replaceExisting {
-			for _, w := range t.getWatches(gvr, ns) {
-				// To avoid the object from being accidentally modified by watcher
-				w.Modify(obj.DeepCopyObject())
-			}
-			t.objects[gvr][namespacedName] = obj
-			return nil
+	for i, existingObj := range t.objects[gvr] {
+		oldMeta, err := meta.Accessor(existingObj)
+		if err != nil {
+			return err
 		}
-		return errors.NewAlreadyExists(gr, newMeta.GetName())
+		if oldMeta.GetNamespace() == newMeta.GetNamespace() && oldMeta.GetName() == newMeta.GetName() {
+			if replaceExisting {
+				for _, w := range t.getWatches(gvr, ns) {
+					w.Modify(obj)
+				}
+				t.objects[gvr][i] = obj
+				return nil
+			}
+			return errors.NewAlreadyExists(gr, newMeta.GetName())
+		}
 	}
 
 	if replaceExisting {
@@ -424,11 +377,10 @@ func (t *tracker) add(gvr schema.GroupVersionResource, obj runtime.Object, ns st
 		return errors.NewNotFound(gr, newMeta.GetName())
 	}
 
-	t.objects[gvr][namespacedName] = obj
+	t.objects[gvr] = append(t.objects[gvr], obj)
 
 	for _, w := range t.getWatches(gvr, ns) {
-		// To avoid the object from being accidentally modified by watcher
-		w.Add(obj.DeepCopyObject())
+		w.Add(obj)
 	}
 
 	return nil
@@ -455,28 +407,35 @@ func (t *tracker) Delete(gvr schema.GroupVersionResource, ns, name string) error
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	objs, ok := t.objects[gvr]
-	if !ok {
-		return errors.NewNotFound(gvr.GroupResource(), name)
+	found := false
+
+	for i, existingObj := range t.objects[gvr] {
+		objMeta, err := meta.Accessor(existingObj)
+		if err != nil {
+			return err
+		}
+		if objMeta.GetNamespace() == ns && objMeta.GetName() == name {
+			obj := t.objects[gvr][i]
+			t.objects[gvr] = append(t.objects[gvr][:i], t.objects[gvr][i+1:]...)
+			for _, w := range t.getWatches(gvr, ns) {
+				w.Delete(obj)
+			}
+			found = true
+			break
+		}
 	}
 
-	namespacedName := types.NamespacedName{Namespace: ns, Name: name}
-	obj, ok := objs[namespacedName]
-	if !ok {
-		return errors.NewNotFound(gvr.GroupResource(), name)
+	if found {
+		return nil
 	}
 
-	delete(objs, namespacedName)
-	for _, w := range t.getWatches(gvr, ns) {
-		w.Delete(obj.DeepCopyObject())
-	}
-	return nil
+	return errors.NewNotFound(gvr.GroupResource(), name)
 }
 
-// filterByNamespace returns all objects in the collection that
-// match provided namespace. Empty namespace matches
+// filterByNamespaceAndName returns all objects in the collection that
+// match provided namespace and name. Empty namespace matches
 // non-namespaced objects.
-func filterByNamespace(objs map[types.NamespacedName]runtime.Object, ns string) ([]runtime.Object, error) {
+func filterByNamespaceAndName(objs []runtime.Object, ns, name string) ([]runtime.Object, error) {
 	var res []runtime.Object
 
 	for _, obj := range objs {
@@ -487,18 +446,12 @@ func filterByNamespace(objs map[types.NamespacedName]runtime.Object, ns string) 
 		if ns != "" && acc.GetNamespace() != ns {
 			continue
 		}
+		if name != "" && acc.GetName() != name {
+			continue
+		}
 		res = append(res, obj)
 	}
 
-	// Sort res to get deterministic order.
-	sort.Slice(res, func(i, j int) bool {
-		acc1, _ := meta.Accessor(res[i])
-		acc2, _ := meta.Accessor(res[j])
-		if acc1.GetNamespace() != acc2.GetNamespace() {
-			return acc1.GetNamespace() < acc2.GetNamespace()
-		}
-		return acc1.GetName() < acc2.GetName()
-	})
 	return res, nil
 }
 
@@ -522,8 +475,12 @@ func (r *SimpleReactor) Handles(action Action) bool {
 	if !verbCovers {
 		return false
 	}
+	resourceCovers := r.Resource == "*" || r.Resource == action.GetResource().Resource
+	if !resourceCovers {
+		return false
+	}
 
-	return resourceCovers(r.Resource, action)
+	return true
 }
 
 func (r *SimpleReactor) React(action Action) (bool, runtime.Object, error) {
@@ -539,7 +496,12 @@ type SimpleWatchReactor struct {
 }
 
 func (r *SimpleWatchReactor) Handles(action Action) bool {
-	return resourceCovers(r.Resource, action)
+	resourceCovers := r.Resource == "*" || r.Resource == action.GetResource().Resource
+	if !resourceCovers {
+		return false
+	}
+
+	return true
 }
 
 func (r *SimpleWatchReactor) React(action Action) (bool, watch.Interface, error) {
@@ -555,27 +517,14 @@ type SimpleProxyReactor struct {
 }
 
 func (r *SimpleProxyReactor) Handles(action Action) bool {
-	return resourceCovers(r.Resource, action)
+	resourceCovers := r.Resource == "*" || r.Resource == action.GetResource().Resource
+	if !resourceCovers {
+		return false
+	}
+
+	return true
 }
 
 func (r *SimpleProxyReactor) React(action Action) (bool, restclient.ResponseWrapper, error) {
 	return r.Reaction(action)
-}
-
-func resourceCovers(resource string, action Action) bool {
-	if resource == "*" {
-		return true
-	}
-
-	if resource == action.GetResource().Resource {
-		return true
-	}
-
-	if index := strings.Index(resource, "/"); index != -1 &&
-		resource[:index] == action.GetResource().Resource &&
-		resource[index+1:] == action.GetSubresource() {
-		return true
-	}
-
-	return false
 }

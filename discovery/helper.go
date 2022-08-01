@@ -19,32 +19,11 @@ package discovery
 import (
 	"fmt"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	apimachineryversion "k8s.io/apimachinery/pkg/version"
 )
-
-// IsResourceEnabled queries the server to determine if the resource specified is present on the server.
-// This is particularly helpful when writing a controller or an e2e test that requires a particular resource to function.
-func IsResourceEnabled(client DiscoveryInterface, resourceToCheck schema.GroupVersionResource) (bool, error) {
-	// this is a single request.  The ServerResourcesForGroupVersion handles the core v1 group as legacy.
-	resourceList, err := client.ServerResourcesForGroupVersion(resourceToCheck.GroupVersion().String())
-	if apierrors.IsNotFound(err) { // if the discovery endpoint isn't present, then the resource isn't present.
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	for _, actualResource := range resourceList.APIResources {
-		if actualResource.Name == resourceToCheck.Resource {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
 
 // MatchesServerVersion queries the server to compares the build version
 // (git hash) of the client with the server's build version. It returns an error
@@ -52,11 +31,11 @@ func IsResourceEnabled(client DiscoveryInterface, resourceToCheck schema.GroupVe
 func MatchesServerVersion(clientVersion apimachineryversion.Info, client DiscoveryInterface) error {
 	sVer, err := client.ServerVersion()
 	if err != nil {
-		return fmt.Errorf("couldn't read version from server: %v", err)
+		return fmt.Errorf("couldn't read version from server: %v\n", err)
 	}
 	// GitVersion includes GitCommit and GitTreeState, but best to be safe?
 	if clientVersion.GitVersion != sVer.GitVersion || clientVersion.GitCommit != sVer.GitCommit || clientVersion.GitTreeState != sVer.GitTreeState {
-		return fmt.Errorf("server version (%#v) differs from client version (%#v)", sVer, clientVersion)
+		return fmt.Errorf("server version (%#v) differs from client version (%#v)!\n", sVer, clientVersion)
 	}
 
 	return nil
@@ -122,15 +101,12 @@ func FilteredBy(pred ResourcePredicate, rls []*metav1.APIResourceList) []*metav1
 	return result
 }
 
-// ResourcePredicate has a method to check if a resource matches a given condition.
 type ResourcePredicate interface {
 	Match(groupVersion string, r *metav1.APIResource) bool
 }
 
-// ResourcePredicateFunc returns true if it matches a resource based on a custom condition.
 type ResourcePredicateFunc func(groupVersion string, r *metav1.APIResource) bool
 
-// Match is a wrapper around ResourcePredicateFunc.
 func (fn ResourcePredicateFunc) Match(groupVersion string, r *metav1.APIResource) bool {
 	return fn(groupVersion, r)
 }
@@ -140,7 +116,6 @@ type SupportsAllVerbs struct {
 	Verbs []string
 }
 
-// Match checks if a resource contains all the given verbs.
 func (p SupportsAllVerbs) Match(groupVersion string, r *metav1.APIResource) bool {
 	return sets.NewString([]string(r.Verbs)...).HasAll(p.Verbs...)
 }

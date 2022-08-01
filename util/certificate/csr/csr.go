@@ -17,279 +17,144 @@ limitations under the License.
 package csr
 
 import (
-	"context"
 	"crypto"
+	"crypto/sha512"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"reflect"
 	"time"
 
-	certificatesv1 "k8s.io/api/certificates/v1"
-	certificatesv1beta1 "k8s.io/api/certificates/v1beta1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"github.com/golang/glog"
+
+	certificates "k8s.io/api/certificates/v1beta1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
-	clientset "k8s.io/client-go/kubernetes"
+	certificatesclient "k8s.io/client-go/kubernetes/typed/certificates/v1beta1"
 	"k8s.io/client-go/tools/cache"
 	watchtools "k8s.io/client-go/tools/watch"
 	certutil "k8s.io/client-go/util/cert"
-	"k8s.io/klog/v2"
-	"k8s.io/utils/pointer"
 )
+
+// RequestNodeCertificate will create a certificate signing request for a node
+// (Organization and CommonName for the CSR will be set as expected for node
+// certificates) and send it to API server, then it will watch the object's
+// status, once approved by API server, it will return the API server's issued
+// certificate (pem-encoded). If there is any errors, or the watch timeouts, it
+// will return an error. This is intended for use on nodes (kubelet and
+// kubeadm).
+func RequestNodeCertificate(client certificatesclient.CertificateSigningRequestInterface, privateKeyData []byte, nodeName types.NodeName) (certData []byte, err error) {
+	subject := &pkix.Name{
+		Organization: []string{"system:nodes"},
+		CommonName:   "system:node:" + string(nodeName),
+	}
+
+	privateKey, err := certutil.ParsePrivateKeyPEM(privateKeyData)
+	if err != nil {
+		return nil, fmt.Errorf("invalid private key for certificate request: %v", err)
+	}
+	csrData, err := certutil.MakeCSR(privateKey, subject, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("unable to generate certificate request: %v", err)
+	}
+
+	usages := []certificates.KeyUsage{
+		certificates.UsageDigitalSignature,
+		certificates.UsageKeyEncipherment,
+		certificates.UsageClientAuth,
+	}
+	name := digestedName(privateKeyData, subject, usages)
+	req, err := RequestCertificate(client, csrData, name, usages, privateKey)
+	if err != nil {
+		return nil, err
+	}
+	return WaitForCertificate(client, req, 3600*time.Second)
+}
 
 // RequestCertificate will either use an existing (if this process has run
 // before but not to completion) or create a certificate signing request using the
-// PEM encoded CSR and send it to API server.  An optional requestedDuration may be passed
-// to set the spec.expirationSeconds field on the CSR to control the lifetime of the issued
-// certificate.  This is not guaranteed as the signer may choose to ignore the request.
-func RequestCertificate(client clientset.Interface, csrData []byte, name, signerName string, requestedDuration *time.Duration, usages []certificatesv1.KeyUsage, privateKey interface{}) (reqName string, reqUID types.UID, err error) {
-	csr := &certificatesv1.CertificateSigningRequest{
+// PEM encoded CSR and send it to API server, then it will watch the object's
+// status, once approved by API server, it will return the API server's issued
+// certificate (pem-encoded). If there is any errors, or the watch timeouts, it
+// will return an error.
+func RequestCertificate(client certificatesclient.CertificateSigningRequestInterface, csrData []byte, name string, usages []certificates.KeyUsage, privateKey interface{}) (req *certificates.CertificateSigningRequest, err error) {
+	csr := &certificates.CertificateSigningRequest{
 		// Username, UID, Groups will be injected by API server.
 		TypeMeta: metav1.TypeMeta{Kind: "CertificateSigningRequest"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},
-		Spec: certificatesv1.CertificateSigningRequestSpec{
-			Request:    csrData,
-			Usages:     usages,
-			SignerName: signerName,
+		Spec: certificates.CertificateSigningRequestSpec{
+			Request: csrData,
+			Usages:  usages,
 		},
 	}
 	if len(csr.Name) == 0 {
 		csr.GenerateName = "csr-"
 	}
-	if requestedDuration != nil {
-		csr.Spec.ExpirationSeconds = DurationToExpirationSeconds(*requestedDuration)
-	}
 
-	reqName, reqUID, err = create(client, csr)
+	req, err = client.Create(csr)
 	switch {
 	case err == nil:
-		return reqName, reqUID, err
-
-	case apierrors.IsAlreadyExists(err) && len(name) > 0:
-		klog.Infof("csr for this node already exists, reusing")
-		req, err := get(client, name)
+	case errors.IsAlreadyExists(err) && len(name) > 0:
+		glog.Infof("csr for this node already exists, reusing")
+		req, err = client.Get(name, metav1.GetOptions{})
 		if err != nil {
-			return "", "", formatError("cannot retrieve certificate signing request: %v", err)
+			return nil, formatError("cannot retrieve certificate signing request: %v", err)
 		}
 		if err := ensureCompatible(req, csr, privateKey); err != nil {
-			return "", "", fmt.Errorf("retrieved csr is not compatible: %v", err)
+			return nil, fmt.Errorf("retrieved csr is not compatible: %v", err)
 		}
-		klog.Infof("csr for this node is still valid")
-		return req.Name, req.UID, nil
-
+		glog.Infof("csr for this node is still valid")
 	default:
-		return "", "", formatError("cannot create certificate signing request: %v", err)
+		return nil, formatError("cannot create certificate signing request: %v", err)
 	}
-}
-
-func DurationToExpirationSeconds(duration time.Duration) *int32 {
-	return pointer.Int32(int32(duration / time.Second))
-}
-
-func ExpirationSecondsToDuration(expirationSeconds int32) time.Duration {
-	return time.Duration(expirationSeconds) * time.Second
-}
-
-func get(client clientset.Interface, name string) (*certificatesv1.CertificateSigningRequest, error) {
-	v1req, v1err := client.CertificatesV1().CertificateSigningRequests().Get(context.TODO(), name, metav1.GetOptions{})
-	if v1err == nil || !apierrors.IsNotFound(v1err) {
-		return v1req, v1err
-	}
-
-	v1beta1req, v1beta1err := client.CertificatesV1beta1().CertificateSigningRequests().Get(context.TODO(), name, metav1.GetOptions{})
-	if v1beta1err != nil {
-		return nil, v1beta1err
-	}
-
-	v1req = &certificatesv1.CertificateSigningRequest{
-		ObjectMeta: v1beta1req.ObjectMeta,
-		Spec: certificatesv1.CertificateSigningRequestSpec{
-			Request: v1beta1req.Spec.Request,
-		},
-	}
-	if v1beta1req.Spec.SignerName != nil {
-		v1req.Spec.SignerName = *v1beta1req.Spec.SignerName
-	}
-	for _, usage := range v1beta1req.Spec.Usages {
-		v1req.Spec.Usages = append(v1req.Spec.Usages, certificatesv1.KeyUsage(usage))
-	}
-	return v1req, nil
-}
-
-func create(client clientset.Interface, csr *certificatesv1.CertificateSigningRequest) (reqName string, reqUID types.UID, err error) {
-	// only attempt a create via v1 if we specified signerName and usages and are not using the legacy unknown signerName
-	if len(csr.Spec.Usages) > 0 && len(csr.Spec.SignerName) > 0 && csr.Spec.SignerName != "kubernetes.io/legacy-unknown" {
-		v1req, v1err := client.CertificatesV1().CertificateSigningRequests().Create(context.TODO(), csr, metav1.CreateOptions{})
-		switch {
-		case v1err != nil && apierrors.IsNotFound(v1err):
-			// v1 CSR API was not found, continue to try v1beta1
-
-		case v1err != nil:
-			// other creation error
-			return "", "", v1err
-
-		default:
-			// success
-			return v1req.Name, v1req.UID, v1err
-		}
-	}
-
-	// convert relevant bits to v1beta1
-	v1beta1csr := &certificatesv1beta1.CertificateSigningRequest{
-		ObjectMeta: csr.ObjectMeta,
-		Spec: certificatesv1beta1.CertificateSigningRequestSpec{
-			SignerName: &csr.Spec.SignerName,
-			Request:    csr.Spec.Request,
-		},
-	}
-	for _, usage := range csr.Spec.Usages {
-		v1beta1csr.Spec.Usages = append(v1beta1csr.Spec.Usages, certificatesv1beta1.KeyUsage(usage))
-	}
-
-	// create v1beta1
-	v1beta1req, v1beta1err := client.CertificatesV1beta1().CertificateSigningRequests().Create(context.TODO(), v1beta1csr, metav1.CreateOptions{})
-	if v1beta1err != nil {
-		return "", "", v1beta1err
-	}
-	return v1beta1req.Name, v1beta1req.UID, nil
+	return req, nil
 }
 
 // WaitForCertificate waits for a certificate to be issued until timeout, or returns an error.
-func WaitForCertificate(ctx context.Context, client clientset.Interface, reqName string, reqUID types.UID) (certData []byte, err error) {
-	fieldSelector := fields.OneTermEqualSelector("metadata.name", reqName).String()
+func WaitForCertificate(client certificatesclient.CertificateSigningRequestInterface, req *certificates.CertificateSigningRequest, timeout time.Duration) (certData []byte, err error) {
+	fieldSelector := fields.OneTermEqualSelector("metadata.name", req.Name).String()
 
-	var lw *cache.ListWatch
-	var obj runtime.Object
-	for {
-		// see if the v1 API is available
-		if _, err := client.CertificatesV1().CertificateSigningRequests().List(ctx, metav1.ListOptions{FieldSelector: fieldSelector}); err == nil {
-			// watch v1 objects
-			obj = &certificatesv1.CertificateSigningRequest{}
-			lw = &cache.ListWatch{
-				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-					options.FieldSelector = fieldSelector
-					return client.CertificatesV1().CertificateSigningRequests().List(ctx, options)
-				},
-				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-					options.FieldSelector = fieldSelector
-					return client.CertificatesV1().CertificateSigningRequests().Watch(ctx, options)
-				},
-			}
-			break
-		} else {
-			klog.V(2).Infof("error fetching v1 certificate signing request: %v", err)
-		}
-
-		// return if we've timed out
-		if err := ctx.Err(); err != nil {
-			return nil, wait.ErrWaitTimeout
-		}
-
-		// see if the v1beta1 API is available
-		if _, err := client.CertificatesV1beta1().CertificateSigningRequests().List(ctx, metav1.ListOptions{FieldSelector: fieldSelector}); err == nil {
-			// watch v1beta1 objects
-			obj = &certificatesv1beta1.CertificateSigningRequest{}
-			lw = &cache.ListWatch{
-				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-					options.FieldSelector = fieldSelector
-					return client.CertificatesV1beta1().CertificateSigningRequests().List(ctx, options)
-				},
-				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-					options.FieldSelector = fieldSelector
-					return client.CertificatesV1beta1().CertificateSigningRequests().Watch(ctx, options)
-				},
-			}
-			break
-		} else {
-			klog.V(2).Infof("error fetching v1beta1 certificate signing request: %v", err)
-		}
-
-		// return if we've timed out
-		if err := ctx.Err(); err != nil {
-			return nil, wait.ErrWaitTimeout
-		}
-
-		// wait and try again
-		time.Sleep(time.Second)
-	}
-
-	var issuedCertificate []byte
-	_, err = watchtools.UntilWithSync(
-		ctx,
-		lw,
-		obj,
-		nil,
+	event, err := watchtools.ListWatchUntil(
+		timeout,
+		&cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				options.FieldSelector = fieldSelector
+				return client.List(options)
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				options.FieldSelector = fieldSelector
+				return client.Watch(options)
+			},
+		},
 		func(event watch.Event) (bool, error) {
 			switch event.Type {
 			case watch.Modified, watch.Added:
 			case watch.Deleted:
-				return false, fmt.Errorf("csr %q was deleted", reqName)
+				return false, fmt.Errorf("csr %q was deleted", req.Name)
 			default:
 				return false, nil
 			}
-
-			switch csr := event.Object.(type) {
-			case *certificatesv1.CertificateSigningRequest:
-				if csr.UID != reqUID {
-					return false, fmt.Errorf("csr %q changed UIDs", csr.Name)
-				}
-				approved := false
-				for _, c := range csr.Status.Conditions {
-					if c.Type == certificatesv1.CertificateDenied {
-						return false, fmt.Errorf("certificate signing request is denied, reason: %v, message: %v", c.Reason, c.Message)
-					}
-					if c.Type == certificatesv1.CertificateFailed {
-						return false, fmt.Errorf("certificate signing request failed, reason: %v, message: %v", c.Reason, c.Message)
-					}
-					if c.Type == certificatesv1.CertificateApproved {
-						approved = true
-					}
-				}
-				if approved {
-					if len(csr.Status.Certificate) > 0 {
-						klog.V(2).Infof("certificate signing request %s is issued", csr.Name)
-						issuedCertificate = csr.Status.Certificate
-						return true, nil
-					}
-					klog.V(2).Infof("certificate signing request %s is approved, waiting to be issued", csr.Name)
-				}
-
-			case *certificatesv1beta1.CertificateSigningRequest:
-				if csr.UID != reqUID {
-					return false, fmt.Errorf("csr %q changed UIDs", csr.Name)
-				}
-				approved := false
-				for _, c := range csr.Status.Conditions {
-					if c.Type == certificatesv1beta1.CertificateDenied {
-						return false, fmt.Errorf("certificate signing request is denied, reason: %v, message: %v", c.Reason, c.Message)
-					}
-					if c.Type == certificatesv1beta1.CertificateFailed {
-						return false, fmt.Errorf("certificate signing request failed, reason: %v, message: %v", c.Reason, c.Message)
-					}
-					if c.Type == certificatesv1beta1.CertificateApproved {
-						approved = true
-					}
-				}
-				if approved {
-					if len(csr.Status.Certificate) > 0 {
-						klog.V(2).Infof("certificate signing request %s is issued", csr.Name)
-						issuedCertificate = csr.Status.Certificate
-						return true, nil
-					}
-					klog.V(2).Infof("certificate signing request %s is approved, waiting to be issued", csr.Name)
-				}
-
-			default:
-				return false, fmt.Errorf("unexpected type received: %T", event.Object)
+			csr := event.Object.(*certificates.CertificateSigningRequest)
+			if csr.UID != req.UID {
+				return false, fmt.Errorf("csr %q changed UIDs", csr.Name)
 			}
-
+			for _, c := range csr.Status.Conditions {
+				if c.Type == certificates.CertificateDenied {
+					return false, fmt.Errorf("certificate signing request is not approved, reason: %v, message: %v", c.Reason, c.Message)
+				}
+				if c.Type == certificates.CertificateApproved && csr.Status.Certificate != nil {
+					return true, nil
+				}
+			}
 			return false, nil
 		},
 	)
@@ -300,31 +165,60 @@ func WaitForCertificate(ctx context.Context, client clientset.Interface, reqName
 		return nil, formatError("cannot watch on the certificate signing request: %v", err)
 	}
 
-	return issuedCertificate, nil
+	return event.Object.(*certificates.CertificateSigningRequest).Status.Certificate, nil
+}
+
+// This digest should include all the relevant pieces of the CSR we care about.
+// We can't direcly hash the serialized CSR because of random padding that we
+// regenerate every loop and we include usages which are not contained in the
+// CSR. This needs to be kept up to date as we add new fields to the node
+// certificates and with ensureCompatible.
+func digestedName(privateKeyData []byte, subject *pkix.Name, usages []certificates.KeyUsage) string {
+	hash := sha512.New512_256()
+
+	// Here we make sure two different inputs can't write the same stream
+	// to the hash. This delimiter is not in the base64.URLEncoding
+	// alphabet so there is no way to have spill over collisions. Without
+	// it 'CN:foo,ORG:bar' hashes to the same value as 'CN:foob,ORG:ar'
+	const delimiter = '|'
+	encode := base64.RawURLEncoding.EncodeToString
+
+	write := func(data []byte) {
+		hash.Write([]byte(encode(data)))
+		hash.Write([]byte{delimiter})
+	}
+
+	write(privateKeyData)
+	write([]byte(subject.CommonName))
+	for _, v := range subject.Organization {
+		write([]byte(v))
+	}
+	for _, v := range usages {
+		write([]byte(v))
+	}
+
+	return "node-csr-" + encode(hash.Sum(nil))
 }
 
 // ensureCompatible ensures that a CSR object is compatible with an original CSR
-func ensureCompatible(new, orig *certificatesv1.CertificateSigningRequest, privateKey interface{}) error {
-	newCSR, err := parseCSR(new.Spec.Request)
+func ensureCompatible(new, orig *certificates.CertificateSigningRequest, privateKey interface{}) error {
+	newCsr, err := ParseCSR(new)
 	if err != nil {
 		return fmt.Errorf("unable to parse new csr: %v", err)
 	}
-	origCSR, err := parseCSR(orig.Spec.Request)
+	origCsr, err := ParseCSR(orig)
 	if err != nil {
 		return fmt.Errorf("unable to parse original csr: %v", err)
 	}
-	if !reflect.DeepEqual(newCSR.Subject, origCSR.Subject) {
-		return fmt.Errorf("csr subjects differ: new: %#v, orig: %#v", newCSR.Subject, origCSR.Subject)
-	}
-	if len(new.Spec.SignerName) > 0 && len(orig.Spec.SignerName) > 0 && new.Spec.SignerName != orig.Spec.SignerName {
-		return fmt.Errorf("csr signerNames differ: new %q, orig: %q", new.Spec.SignerName, orig.Spec.SignerName)
+	if !reflect.DeepEqual(newCsr.Subject, origCsr.Subject) {
+		return fmt.Errorf("csr subjects differ: new: %#v, orig: %#v", newCsr.Subject, origCsr.Subject)
 	}
 	signer, ok := privateKey.(crypto.Signer)
 	if !ok {
 		return fmt.Errorf("privateKey is not a signer")
 	}
-	newCSR.PublicKey = signer.Public()
-	if err := newCSR.CheckSignature(); err != nil {
+	newCsr.PublicKey = signer.Public()
+	if err := newCsr.CheckSignature(); err != nil {
 		return fmt.Errorf("error validating signature new CSR against old key: %v", err)
 	}
 	if len(new.Status.Certificate) > 0 {
@@ -345,20 +239,25 @@ func ensureCompatible(new, orig *certificatesv1.CertificateSigningRequest, priva
 // formatError preserves the type of an API message but alters the message. Expects
 // a single argument format string, and returns the wrapped error.
 func formatError(format string, err error) error {
-	if s, ok := err.(apierrors.APIStatus); ok {
-		se := &apierrors.StatusError{ErrStatus: s.Status()}
+	if s, ok := err.(errors.APIStatus); ok {
+		se := &errors.StatusError{ErrStatus: s.Status()}
 		se.ErrStatus.Message = fmt.Sprintf(format, se.ErrStatus.Message)
 		return se
 	}
 	return fmt.Errorf(format, err)
 }
 
-// parseCSR extracts the CSR from the API object and decodes it.
-func parseCSR(pemData []byte) (*x509.CertificateRequest, error) {
+// ParseCSR extracts the CSR from the API object and decodes it.
+func ParseCSR(obj *certificates.CertificateSigningRequest) (*x509.CertificateRequest, error) {
 	// extract PEM from request object
-	block, _ := pem.Decode(pemData)
+	pemBytes := obj.Spec.Request
+	block, _ := pem.Decode(pemBytes)
 	if block == nil || block.Type != "CERTIFICATE REQUEST" {
 		return nil, fmt.Errorf("PEM block type must be CERTIFICATE REQUEST")
 	}
-	return x509.ParseCertificateRequest(block.Bytes)
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	return csr, nil
 }
